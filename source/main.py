@@ -3,6 +3,7 @@ import torch
 import numpy as np
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
+import os
 
 
 def initialize_model() -> YOLO:
@@ -93,5 +94,5 @@ def main(video_path: str, output_path: str = 'output.mp4') -> None:
 
 
 if __name__ == "__main__":
-    video_path = r"C:\Users\Lenovo\OneDrive\Dokumente\MatchMetrics\examples\TuerkGuecu_1.mp4"
-    main(video_path)
+    grandparent_dir = os.path.dirname(os.path.dirname(__file__))
+    main(os.path.join(grandparent_dir, "examples\TuerkGuecu_1.mp4"))
