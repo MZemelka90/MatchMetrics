@@ -5,15 +5,15 @@ from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
 
-def initialize_model():
+def initialize_model() -> YOLO:
     return YOLO('yolov8m.pt')
 
 
-def initialize_tracker():
+def initialize_tracker() -> DeepSort:
     return DeepSort(max_age=70, nms_max_overlap=1.0, nn_budget=100)
 
 
-def initialize_video_capture(video_path):
+def initialize_video_capture(video_path: str) -> tuple[cv2.VideoCapture, int, int, int]:
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -21,11 +21,11 @@ def initialize_video_capture(video_path):
     return cap, fps, width, height
 
 
-def initialize_video_writer(output_path, fps, width, height):
+def initialize_video_writer(output_path: str, fps: int, width: int, height: int) -> cv2.VideoWriter:
     return cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
 
 
-def process_detections(results):
+def process_detections(results: list[torch.Tensor]) -> list[tuple[list[int], float, int]]:
     detections = []
     for result in results:
         for box in result.boxes:
@@ -42,7 +42,7 @@ def process_detections(results):
     return detections
 
 
-def draw_triangle(frame, x1, y1, x2, y2, color):
+def draw_triangle(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, color: tuple[int, int, int]) -> None:
     points = np.array([
         [x1, int(y1 - 0.2 * (y2 - y1)) - 15],
         [x2, int(y1 - 0.2 * (y2 - y1)) - 15],
@@ -51,7 +51,7 @@ def draw_triangle(frame, x1, y1, x2, y2, color):
     cv2.drawContours(frame, [points], 0, color, -1)
 
 
-def annotate_frame(frame, tracks, detections):
+def annotate_frame(frame: np.ndarray, tracks: list, detections: list[tuple[list[int], float, int]]) -> None:
     for track, (bbox, _, class_id) in zip(tracks, detections):
         if not track.is_confirmed():
             continue
@@ -65,7 +65,7 @@ def annotate_frame(frame, tracks, detections):
         cv2.putText(frame, f'ID {track_id}', text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
 
-def main(video_path, output_path='output.mp4'):
+def main(video_path: str, output_path: str = 'output.mp4') -> None:
     model = initialize_model()
     tracker = initialize_tracker()
     cap, fps, width, height = initialize_video_capture(video_path)
