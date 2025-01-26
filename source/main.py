@@ -3,7 +3,10 @@ import torch
 import numpy as np
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
+from helper import initialize_video_capture, initialize_video_writer
 import os
+from collections import Counter
+
 
 
 def initialize_model():
@@ -12,18 +15,6 @@ def initialize_model():
 
 def initialize_tracker():
     return DeepSort(max_age=100, nms_max_overlap=0.8, nn_budget=150)
-
-
-def initialize_video_capture(video_path):
-    cap = cv2.VideoCapture(video_path)
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) // 1.25)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) // 1.25)
-    return cap, fps, width, height
-
-
-def initialize_video_writer(output_path, fps, width, height):
-    return cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
 
 
 def process_detections(results):
@@ -43,7 +34,7 @@ def process_detections(results):
             cy = (y1 + y2) // 2
             width = x2 - x1
             height = y2 - y1
-            detections.append(([cx, cy, width, height], conf, class_id))
+            detections.append(([x1, y1, width, height], conf, class_id))
 
             # Speichere die Ballposition für Tracking
             if class_id == 32:
@@ -71,6 +62,52 @@ def optical_flow_tracking(old_gray, frame_gray, prev_ball):
     return None  # Falls Tracking fehlschlägt
 
 
+def draw_transparent_ellipse(frame, center, axes, color, thickness=2):
+    overlay = frame.copy()
+    cv2.ellipse(overlay,
+                center=center,
+                axes=axes,
+                angle=0,
+                startAngle=-45,
+                endAngle=235,
+                color=color,
+                thickness=thickness,
+                lineType=cv2.LINE_4
+                )
+    alpha = 0.5  # Transparenzgrad
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+
+def draw_inverted_triangle(frame, center, size):
+    overlay = frame.copy()
+    triangle_pts = np.array([
+        [center[0] - size, center[1] - size],
+        [center[0] + size, center[1] - size],
+        [center[0], center[1] + size]
+    ], np.int32)
+    cv2.fillPoly(overlay, [triangle_pts], (0, 0, 0))
+    alpha = 0.5
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+
+def get_dominant_color(image, bbox):
+    """Berechnet den Mittelwert der Farben im oberen Bereich der Bounding Box und verdoppelt den höchsten Wert."""
+    x, y, w, h = bbox
+    roi = image[y:y + h, x:x + w]
+
+    # Berechne den Mittelwert der Farben im ROI
+    average_color = np.mean(roi, axis=(0, 1))
+
+    # Identifiziere den höchsten Farbwert
+    max_channel = max(average_color)
+
+    # Verdopple den höchsten Wert, stelle aber sicher, dass er nicht über 255 geht
+    adjusted_color = tuple(
+        min(int(value * 2) if value == max_channel else int(value), 255) for value in average_color)
+
+    return adjusted_color
+
+
 def main(video_path, output_path='output.mp4'):
     model = initialize_model()
     tracker = initialize_tracker()
@@ -81,7 +118,7 @@ def main(video_path, output_path='output.mp4'):
     old_frame = cv2.resize(old_frame, (frame_width, frame_height))
     old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
 
-    prev_ball = None  # Letzte bekannte Position des Balls
+    prev_ball = None
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -90,7 +127,6 @@ def main(video_path, output_path='output.mp4'):
 
         frame = cv2.resize(frame, (frame_width, frame_height))
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
         results = model(frame, verbose=False)
         detections, ball_bbox = process_detections(results)
 
@@ -99,18 +135,24 @@ def main(video_path, output_path='output.mp4'):
 
         if ball_bbox is not None:
             x1, y1, x2, y2 = ball_bbox
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Ball in Blau markieren
-            prev_ball = ball_bbox  # Speichere die neue Ballposition
+            center = ((x1 + x2) // 2, y2)  # Am unteren Rand des Balls
+            axes = (max(abs(x2 - x1) // 2, 10), max(abs(y2 - y1) // 6, 5))
+            draw_transparent_ellipse(frame, center, axes, (0, 0, 0), 1)
+            draw_inverted_triangle(frame, ((x1 + x2) // 2, y1 - 15), 6)
+            prev_ball = ball_bbox
 
         tracks = tracker.update_tracks(detections, frame=frame)
 
         for track in tracks:
-            if not track.is_confirmed():
+            if not track.is_confirmed() or track.get_det_class() == 32:
                 continue
             track_id = track.track_id
             cx, cy, width, height = track.to_tlwh()
-            color = (0, 255, 0) if track.get_det_class() == 0 else (255, 0, 0)
-            cv2.putText(frame, f'ID{track_id}', (int(cx), int(cy)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            center = (int(cx + width // 2), int(cy + height))
+            axes = (int(width), int(0.35 * width))
+
+            dominant_color = get_dominant_color(frame, (int(cx), int(cy), int(width), int(height)))
+            draw_transparent_ellipse(frame, center, axes, dominant_color, 2)
 
         old_gray = frame_gray.copy()
         out.write(frame)
