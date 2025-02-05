@@ -89,11 +89,40 @@ def draw_inverted_triangle(frame, center: CoordinateConverter, size):
     cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
 
 def get_dominant_color(image, bbox):
+    """
+    Calculate the dominant color in the bounding box region.
+    Returns a default color (white) if the bounding box is invalid.
+    """
     x, y, w, h = bbox
+
+    # Check if the bounding box is valid
+    if w <= 0 or h <= 0:
+        return (255, 255, 255)  # Return white as a default color
+
+    # Ensure the bounding box is within the image boundaries
+    x = max(0, min(x, image.shape[1] - 1))
+    y = max(0, min(y, image.shape[0] - 1))
+    w = min(w, image.shape[1] - x)
+    h = min(h, image.shape[0] - y)
+
+    # If the bounding box is still invalid, return a default color
+    if w <= 0 or h <= 0:
+        return (255, 255, 255)  # Return white as a default color
+
+    # Extract the region of interest (ROI)
     roi = image[y:y + h, x:x + w]
-    average_color = np.mean(roi, axis=(0, 1))
+
+    # Calculate the average color in the ROI
+    average_color = np.nanmean(roi, axis=(0, 1))  # Use nanmean to ignore NaN values
+
+    # If average_color contains NaN values, return a default color
+    if np.isnan(average_color).any():
+        return (255, 255, 255)  # Return white as a default color
+
+    # Identify the dominant channel and adjust the color
     max_channel = max(average_color)
     adjusted_color = tuple(min(int(value * 2) if value == max_channel else int(value), 255) for value in average_color)
+
     return adjusted_color
 
 def main(video_path, output_path='output.mp4'):
@@ -162,6 +191,7 @@ def main(video_path, output_path='output.mp4'):
                 # If no significant overlap, skip drawing this track
                 continue
 
+            # Get dominant color and draw ellipse at feet position
             dominant_color = get_dominant_color(frame, (int(cx), int(cy), int(width), int(height)))
             draw_transparent_ellipse(frame, feet_position, (track_det.width // 2, track_det.height // 6), dominant_color, 2)
 
@@ -171,6 +201,10 @@ def main(video_path, output_path='output.mp4'):
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
+
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
 
     cap.release()
     out.release()
