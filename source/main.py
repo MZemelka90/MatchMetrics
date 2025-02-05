@@ -6,16 +6,34 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 from helper import initialize_video_capture, initialize_video_writer
 import os
 from collections import Counter
-
-
+from detection import Detection, CoordinateConverter
 
 def initialize_model():
     return YOLO('yolov8m.pt')
 
-
 def initialize_tracker():
-    return DeepSort(max_age=100, nms_max_overlap=0.8, nn_budget=150)
+    # Tune DeepSort parameters for better tracking
+    return DeepSort(max_age=15, nms_max_overlap=0.7, nn_budget=100, max_iou_distance=0.7)
 
+def calculate_iou(box1, box2):
+    """
+    Calculate Intersection over Union (IoU) between two bounding boxes.
+    Each box is represented as [x1, y1, x2, y2].
+    """
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    # Calculate intersection area
+    intersection_area = max(0, x2 - x1) * max(0, y2 - y1)
+
+    # Calculate union area
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union_area = box1_area + box2_area - intersection_area
+
+    return intersection_area / union_area if union_area > 0 else 0
 
 def process_detections(results):
     detections = []
@@ -24,89 +42,59 @@ def process_detections(results):
     for result in results:
         for box in result.boxes:
             class_id = int(box.cls[0])
-            if class_id not in [0, 32]:  # 0 = Person, 32 = Ball
+            if class_id not in [0, 32]:  # 0: person, 32: sports ball
                 continue
             conf = float(box.conf[0])
-            if conf < 0.2:  # Konfidenz niedriger setzen, um mehr Erkennungen zu bekommen
+            if conf < 0.5:  # Increased confidence threshold for detections
                 continue
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
-            width = x2 - x1
-            height = y2 - y1
-            detections.append(([x1, y1, width, height], conf, class_id))
+            detections.append(Detection(x1, y1, x2 - x1, y2 - y1, conf, class_id))
 
-            # Speichere die Ballposition für Tracking
             if class_id == 32:
-                ball_bbox = (x1, y1, x2, y2)
+                ball_bbox = Detection(x1, y1, x2 - x1, y2 - y1, conf, class_id)
 
     return detections, ball_bbox
 
-
-def optical_flow_tracking(old_gray, frame_gray, prev_ball):
-    """Verfolge den Ball mit optischem Fluss, falls YOLO ihn nicht erkennt."""
+def optical_flow_tracking(old_gray, frame_gray, prev_ball: Detection):
     if prev_ball is None:
         return None
 
-    x1, y1, x2, y2 = prev_ball
+    x1, y1, x2, y2 = prev_ball.x, prev_ball.y, prev_ball.x + prev_ball.width, prev_ball.y + prev_ball.height
     center = np.array([[[(x1 + x2) // 2, (y1 + y2) // 2]]], dtype=np.float32)
 
     lk_params = dict(winSize=(15, 15), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
     p1, st, err = cv2.calcOpticalFlowPyrLK(old_gray, frame_gray, center, None, **lk_params)
 
-    if st[0][0] == 1:  # Falls das Tracking erfolgreich war
+    if st[0][0] == 1:
         new_x, new_y = p1[0][0]
-        return (
-        int(new_x - (x2 - x1) / 2), int(new_y - (y2 - y1) / 2), int(new_x + (x2 - x1) / 2), int(new_y + (y2 - y1) / 2))
+        return Detection(new_x - (x2 - x1) / 2, new_y - (y2 - y1) / 2, x2 - x1, y2 - y1, prev_ball.conf, prev_ball.class_id)
 
-    return None  # Falls Tracking fehlschlägt
+    return None
 
-
-def draw_transparent_ellipse(frame, center, axes, color, thickness=2):
+def draw_transparent_ellipse(frame, center: CoordinateConverter, axes, color, thickness=2):
     overlay = frame.copy()
-    cv2.ellipse(overlay,
-                center=center,
-                axes=axes,
-                angle=0,
-                startAngle=-45,
-                endAngle=235,
-                color=color,
-                thickness=thickness,
-                lineType=cv2.LINE_4
-                )
-    alpha = 0.5  # Transparenzgrad
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    center_tuple = (int(center.x), int(center.y))
+    axes_tuple = (int(axes[0]), int(axes[1]))
+    cv2.ellipse(overlay, center_tuple, axes_tuple, 0, -45, 235, color, thickness, lineType=cv2.LINE_4)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
 
-
-def draw_inverted_triangle(frame, center, size):
+def draw_inverted_triangle(frame, center: CoordinateConverter, size):
     overlay = frame.copy()
     triangle_pts = np.array([
-        [center[0] - size, center[1] - size],
-        [center[0] + size, center[1] - size],
-        [center[0], center[1] + size]
+        [center.x - size, center.y - size],
+        [center.x + size, center.y - size],
+        [center.x, center.y + size]
     ], np.int32)
     cv2.fillPoly(overlay, [triangle_pts], (0, 0, 0))
-    alpha = 0.5
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
 
 def get_dominant_color(image, bbox):
-    """Berechnet den Mittelwert der Farben im oberen Bereich der Bounding Box und verdoppelt den höchsten Wert."""
     x, y, w, h = bbox
     roi = image[y:y + h, x:x + w]
-
-    # Berechne den Mittelwert der Farben im ROI
     average_color = np.mean(roi, axis=(0, 1))
-
-    # Identifiziere den höchsten Farbwert
     max_channel = max(average_color)
-
-    # Verdopple den höchsten Wert, stelle aber sicher, dass er nicht über 255 geht
-    adjusted_color = tuple(
-        min(int(value * 2) if value == max_channel else int(value), 255) for value in average_color)
-
+    adjusted_color = tuple(min(int(value * 2) if value == max_channel else int(value), 255) for value in average_color)
     return adjusted_color
-
 
 def main(video_path, output_path='output.mp4'):
     model = initialize_model()
@@ -130,29 +118,52 @@ def main(video_path, output_path='output.mp4'):
         results = model(frame, verbose=False)
         detections, ball_bbox = process_detections(results)
 
-        if ball_bbox is None and prev_ball is not None:  # Falls YOLO den Ball nicht findet
+        if ball_bbox is None and prev_ball is not None:
             ball_bbox = optical_flow_tracking(old_gray, frame_gray, prev_ball)
 
         if ball_bbox is not None:
-            x1, y1, x2, y2 = ball_bbox
-            center = ((x1 + x2) // 2, y2)  # Am unteren Rand des Balls
-            axes = (max(abs(x2 - x1) // 2, 10), max(abs(y2 - y1) // 6, 5))
-            draw_transparent_ellipse(frame, center, axes, (0, 0, 0), 1)
-            draw_inverted_triangle(frame, ((x1 + x2) // 2, y1 - 15), 6)
+            draw_transparent_ellipse(frame,
+                                     ball_bbox.bottom_center,
+                                     (ball_bbox.width // 2,
+                                      max(ball_bbox.height // 6, 5)),
+                                     (0, 0, 0),
+                                     1
+                                     )
+            draw_inverted_triangle(frame, ball_bbox.top_center, 6)
             prev_ball = ball_bbox
 
-        tracks = tracker.update_tracks(detections, frame=frame)
+        # Update tracks with detections
+        tracks = tracker.update_tracks(
+            [([d.x, d.y, d.width, d.height], d.conf, d.class_id) for d in detections],
+            frame=frame
+        )
 
+        # Draw tracks only if they are confirmed and not the ball
         for track in tracks:
             if not track.is_confirmed() or track.get_det_class() == 32:
                 continue
             track_id = track.track_id
             cx, cy, width, height = track.to_tlwh()
-            center = (int(cx + width // 2), int(cy + height))
-            axes = (int(width), int(0.35 * width))
+            track_det = Detection(int(cx), int(cy), int(width), int(height), 1, track_id)
+
+            # Calculate feet position (bottom center of the bounding box)
+            feet_position = CoordinateConverter(int(cx + width // 2), int(cy + height))
+
+            # Custom overlap check to prevent duplicate tracks
+            for detection in detections:
+                if detection.class_id == 0:  # Only check for players
+                    iou = calculate_iou(
+                        [cx, cy, cx + width, cy + height],
+                        [detection.x, detection.y, detection.x + detection.width, detection.y + detection.height]
+                    )
+                    if iou > 0.5:  # If overlap is significant, associate detection with existing track
+                        break
+            else:
+                # If no significant overlap, skip drawing this track
+                continue
 
             dominant_color = get_dominant_color(frame, (int(cx), int(cy), int(width), int(height)))
-            draw_transparent_ellipse(frame, center, axes, dominant_color, 2)
+            draw_transparent_ellipse(frame, feet_position, (track_det.width // 2, track_det.height // 6), dominant_color, 2)
 
         old_gray = frame_gray.copy()
         out.write(frame)
@@ -164,7 +175,6 @@ def main(video_path, output_path='output.mp4'):
     cap.release()
     out.release()
     cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     grandparent_dir = os.path.dirname(os.path.dirname(__file__))
