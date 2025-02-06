@@ -5,34 +5,32 @@ from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from helper import initialize_video_capture, initialize_video_writer
 import os
-from collections import Counter
+from collections import deque
 from detection import Detection, CoordinateConverter
+from sklearn.linear_model import RANSACRegressor
+
+# Constants for event detection
+SHOT_SPEED_THRESHOLD = 15  # Minimum horizontal speed for a shot (pixels/frame)
+SHOT_CURVATURE_THRESHOLD = 0.005  # Maximum curvature for a shot
+PASS_SPEED_THRESHOLD = 5  # Minimum speed for a pass (pixels/frame)
+PASS_DISTANCE_THRESHOLD = 30  # Minimum distance for a pass (pixels)
+TRAJECTORY_LENGTH = 5  # Number of ball positions to analyze
 
 def initialize_model():
     return YOLO('yolov8m.pt')
 
 def initialize_tracker():
-    # Tune DeepSort parameters for better tracking
     return DeepSort(max_age=15, nms_max_overlap=0.7, nn_budget=100, max_iou_distance=0.7)
 
 def calculate_iou(box1, box2):
-    """
-    Calculate Intersection over Union (IoU) between two bounding boxes.
-    Each box is represented as [x1, y1, x2, y2].
-    """
     x1 = max(box1[0], box2[0])
     y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2])
     y2 = min(box1[3], box2[3])
-
-    # Calculate intersection area
     intersection_area = max(0, x2 - x1) * max(0, y2 - y1)
-
-    # Calculate union area
     box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
     box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
     union_area = box1_area + box2_area - intersection_area
-
     return intersection_area / union_area if union_area > 0 else 0
 
 def process_detections(results):
@@ -89,41 +87,60 @@ def draw_inverted_triangle(frame, center: CoordinateConverter, size):
     cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
 
 def get_dominant_color(image, bbox):
-    """
-    Calculate the dominant color in the bounding box region.
-    Returns a default color (white) if the bounding box is invalid.
-    """
     x, y, w, h = bbox
-
-    # Check if the bounding box is valid
     if w <= 0 or h <= 0:
         return (255, 255, 255)  # Return white as a default color
-
-    # Ensure the bounding box is within the image boundaries
     x = max(0, min(x, image.shape[1] - 1))
     y = max(0, min(y, image.shape[0] - 1))
     w = min(w, image.shape[1] - x)
     h = min(h, image.shape[0] - y)
-
-    # If the bounding box is still invalid, return a default color
     if w <= 0 or h <= 0:
         return (255, 255, 255)  # Return white as a default color
-
-    # Extract the region of interest (ROI)
     roi = image[y:y + h, x:x + w]
-
-    # Calculate the average color in the ROI
-    average_color = np.nanmean(roi, axis=(0, 1))  # Use nanmean to ignore NaN values
-
-    # If average_color contains NaN values, return a default color
+    average_color = np.nanmean(roi, axis=(0, 1))
     if np.isnan(average_color).any():
         return (255, 255, 255)  # Return white as a default color
-
-    # Identify the dominant channel and adjust the color
     max_channel = max(average_color)
     adjusted_color = tuple(min(int(value * 2) if value == max_channel else int(value), 255) for value in average_color)
-
     return adjusted_color
+
+def detect_events(ball_positions, frame):
+    """
+    Detect shot and pass events using robust trajectory analysis.
+    """
+    if len(ball_positions) < TRAJECTORY_LENGTH:
+        return
+
+    # Convert deque to list for slicing
+    ball_positions_list = list(ball_positions)
+
+    # Use the last N ball positions for analysis
+    trajectory = np.array(ball_positions_list[-TRAJECTORY_LENGTH:])  # shape (N, 2)
+
+    # Compute velocities between frames (in pixels/frame)
+    velocities = np.diff(trajectory, axis=0)
+    horiz_speed = np.linalg.norm(velocities[:, 0])
+    avg_horiz_speed = np.mean(horiz_speed)
+
+    # Use RANSAC to fit a quadratic curve for the vertical (y) component as a function of horizontal (x)
+    X = trajectory[:, 0].reshape(-1, 1)
+    y = trajectory[:, 1]
+    poly_features = np.hstack([X, X**2])
+    try:
+        ransac = RANSACRegressor(min_samples=3, residual_threshold=5)
+        ransac.fit(poly_features, y)
+        curvature = abs(ransac.estimator_.coef_[1])  # Quadratic coefficient
+    except Exception as e:
+        print(f"RANSAC quadratic fit failed: {e}")
+        curvature = 0
+
+    # Detect shot: High horizontal speed and shallow curvature
+    # if avg_horiz_speed > SHOT_SPEED_THRESHOLD and curvature < SHOT_CURVATURE_THRESHOLD:
+        # cv2.putText(frame, "SHOT!", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
+
+    # Detect pass: High speed and large distance between consecutive positions
+    if avg_horiz_speed > PASS_SPEED_THRESHOLD and np.linalg.norm(trajectory[-1] - trajectory[-2]) > PASS_DISTANCE_THRESHOLD:
+        cv2.putText(frame, "PASS!", (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
 
 def main(video_path, output_path='output.mp4'):
     model = initialize_model()
@@ -136,6 +153,7 @@ def main(video_path, output_path='output.mp4'):
     old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
 
     prev_ball = None
+    ball_positions = deque(maxlen=TRAJECTORY_LENGTH)  # Store the last N ball positions
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -151,6 +169,13 @@ def main(video_path, output_path='output.mp4'):
             ball_bbox = optical_flow_tracking(old_gray, frame_gray, prev_ball)
 
         if ball_bbox is not None:
+            # Store the ball's center position
+            ball_center = (int(ball_bbox.x + ball_bbox.width / 2), int(ball_bbox.y + ball_bbox.height / 2))
+            ball_positions.append(ball_center)
+
+            # Detect events (shot or pass)
+            detect_events(ball_positions, frame)
+
             draw_transparent_ellipse(frame,
                                      ball_bbox.bottom_center,
                                      (ball_bbox.width // 2,
@@ -206,10 +231,6 @@ def main(video_path, output_path='output.mp4'):
     out.release()
     cv2.destroyAllWindows()
 
-    cap.release()
-    out.release()
-    cv2.destroyAllWindows()
-
 if __name__ == "__main__":
     grandparent_dir = os.path.dirname(os.path.dirname(__file__))
-    main(os.path.join(grandparent_dir, "examples/TuerkGuecu_1.mp4"))
+    main(os.path.join(grandparent_dir, "examples/TuerkGuecu_2.mp4"))
