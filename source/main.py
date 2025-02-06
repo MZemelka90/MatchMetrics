@@ -15,6 +15,8 @@ SHOT_CURVATURE_THRESHOLD = 0.005  # Maximum curvature for a shot
 PASS_SPEED_THRESHOLD = 5  # Minimum speed for a pass (pixels/frame)
 PASS_DISTANCE_THRESHOLD = 30  # Minimum distance for a pass (pixels)
 TRAJECTORY_LENGTH = 5  # Number of ball positions to analyze
+PROXIMITY_THRESHOLD = 80  # Maximum distance to consider a player close to the ball (pixels)
+MIN_KICK_DISTANCE = 30  # Minimum distance the ball must travel to be considered a kick (pixels)
 
 def initialize_model():
     return YOLO('yolov8m.pt')
@@ -104,7 +106,7 @@ def get_dominant_color(image, bbox):
     adjusted_color = tuple(min(int(value * 2) if value == max_channel else int(value), 255) for value in average_color)
     return adjusted_color
 
-def detect_events(ball_positions, frame):
+def detect_events(ball_positions, player_positions, frame):
     """
     Detect shot and pass events using robust trajectory analysis.
     """
@@ -139,8 +141,22 @@ def detect_events(ball_positions, frame):
         # cv2.putText(frame, "SHOT!", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
 
     # Detect pass: High speed and large distance between consecutive positions
-    if avg_horiz_speed > PASS_SPEED_THRESHOLD and np.linalg.norm(trajectory[-1] - trajectory[-2]) > PASS_DISTANCE_THRESHOLD:
-        cv2.putText(frame, "PASS!", (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+    # if avg_horiz_speed > PASS_SPEED_THRESHOLD and np.linalg.norm(trajectory[-1] - trajectory[-2]) > PASS_DISTANCE_THRESHOLD:
+        # cv2.putText(frame, "PASS!", (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+
+    # Detect kick: Ball moves away from a player after being close
+    if len(player_positions) > 0:
+        # Find the closest player to the ball at the start of the trajectory
+        initial_ball_position = trajectory[0]
+        closest_player = min(player_positions, key=lambda p: np.linalg.norm(np.array(p) - initial_ball_position))
+        distance_to_player = np.linalg.norm(np.array(closest_player) - initial_ball_position)
+
+        # Check if the ball was close to the player initially
+        if distance_to_player < PROXIMITY_THRESHOLD:
+            # Check if the ball has moved a minimum distance away from the player
+            final_distance = np.linalg.norm(np.array(closest_player) - trajectory[-1])
+            if final_distance - distance_to_player > MIN_KICK_DISTANCE:
+                cv2.putText(frame, "KICK!", (closest_player[0] + 10, closest_player[1]), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 3)
 
 def main(video_path, output_path='output.mp4'):
     model = initialize_model()
@@ -173,8 +189,14 @@ def main(video_path, output_path='output.mp4'):
             ball_center = (int(ball_bbox.x + ball_bbox.width / 2), int(ball_bbox.y + ball_bbox.height / 2))
             ball_positions.append(ball_center)
 
-            # Detect events (shot or pass)
-            detect_events(ball_positions, frame)
+            # Extract player positions from detections
+            player_positions = [
+                (int(d.x + d.width / 2), int(d.y + d.height / 2))  # Use center of bounding box
+                for d in detections if d.class_id == 0  # Only include players
+            ]
+
+            # Detect events (shot, pass, or kick)
+            detect_events(ball_positions, player_positions, frame)
 
             draw_transparent_ellipse(frame,
                                      ball_bbox.bottom_center,
